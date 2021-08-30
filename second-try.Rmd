@@ -1,0 +1,118 @@
+---
+title: "A first try"
+author: "Franzi"
+date: "2 7 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Einlesen:
+
+```{r}
+train <- read.csv("~/R/Titanic/train.csv")
+test <- read.csv("~/R/Titanic/test.csv")
+library(dplyr)
+library(Hmisc)
+library(caret)
+```
+
+## Explorative Datenanalyse
+
+First glimpse
+
+```{r}
+head(train)
+summary(train)
+```
+
+There are quite a number of na's in the age variable:
+
+```{r}
+sum(is.na(train$Age))
+```
+
+How to impute it? If there is more than 1 spouse/sibling around, it is likely that it is a child. Hence, we put the age to be 10. If the person is female and the name includes "Mrs", then she is (supposedly) married and we put the age to be 40.
+
+```{r}
+train %>% mutate(Age=ifelse(is.na(Age) & SibSp>1,10,Age)) -> train
+train %>% mutate(Age=ifelse(is.na(Age) & grepl("Mrs|Mlle",Name),40,Age)) -> train
+
+test %>% mutate(Age=ifelse(is.na(Age) & SibSp>1,10,Age)) -> test
+test %>% mutate(Age=ifelse(is.na(Age) & grepl(c("Mlle"),Name),40,Age)) -> test
+
+```
+
+Impute fares (fixed mistake compared to v2)
+
+```{r}
+
+meanFare <- function(pc){
+                    mean(filter(train,Pclass==pc)$Fare)
+}
+train %>% rowwise() %>% mutate(Fare=ifelse(is.na(Fare) | Fare=="0",meanFare(Pclass),Fare)) -> train
+test %>% rowwise() %>% mutate(Fare=ifelse(is.na(Fare) | Fare == "0",meanFare(Pclass),Fare)) -> test 
+```
+
+
+## Using Caret
+
+Entscheidungsbaum:
+
+```{r}
+
+trainsub <- select(train, PassengerId | Survived | Sex | Age | Fare | Embarked)
+trainsub$Survived <- as.factor(trainsub$Survived)
+
+tit_train_control <- trainControl(method="cv",number=10)
+preProcessing <- preProcess(select(trainsub,- (Survived)),method=c("knnImpute"))
+
+trainPrepro <- predict(preProcessing,trainsub)
+
+my_tuning_grid <- expand.grid(cp = seq(0.01,0.06,0.01))
+
+tree <- train(Survived ~ Age + Fare + Sex, data=trainPrepro, method="rpart",trControl=tit_train_control, tuneGrid=my_tuning_grid)
+
+prediction <- predict(tree,trainPrepro)
+
+confusionMatrix(prediction,trainPrepro$Survived)
+
+```
+
+
+Random forest:
+
+```{r}
+
+trainsub<- select(train, PassengerId | Survived | Sex | Age | Fare | Embarked)
+trainsub$Survived <- as.factor(trainsub$Survived)
+
+tit_train_control <- trainControl(method="cv",number=10)
+preProcessing <- preProcess(select(trainsub,- (Survived)),method=c("knnImpute"))
+trainPrepro <- predict(preProcessing,trainsub)
+
+my_tuning_grid <- expand.grid(mtry = c(2, 3),
+                      splitrule = c("gini", "extratrees"),
+                      min.node.size = c(1, 2))
+
+tree <- train(Survived ~ Age + Fare + Sex + Embarked, data=trainPrepro, method="ranger",trControl=tit_train_control, tuneGrid=my_tuning_grid)
+
+prediction <- predict(tree,trainPrepro)
+
+confusionMatrix(prediction,trainPrepro$Survived)
+
+```
+
+Apply to test data:
+
+```{r}
+testsub <- select(test, PassengerId | Sex | Age | Fare | Embarked)
+testPrepro <- predict(preProcessing,testsub)
+testprediction <- predict(tree,newdata=testPrepro,na.action = na.pass)
+
+results <- data.frame(PassengerId=testsub$PassengerId,Survived=as.integer(as.character(testprediction)))
+write.table(results,"~/R/Titanic/results.csv",sep=",",row.names = FALSE)
+
+```

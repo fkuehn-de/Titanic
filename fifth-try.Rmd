@@ -1,0 +1,194 @@
+---
+title: "A first try"
+author: "Franzi"
+date: "2 7 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Einlesen:
+
+```{r}
+train <- read.csv("~/R/Titanic/train.csv")
+test <- read.csv("~/R/Titanic/test.csv")
+library(dplyr)
+library(Hmisc)
+library(caret)
+library(mlr)
+library(tuneRanger)
+```
+
+## Explorative Datenanalyse
+
+First glimpse
+
+```{r}
+head(train)
+summary(train)
+```
+
+There are quite a number of na's in the age variable:
+
+```{r}
+sum(is.na(train$Age))
+```
+
+How to impute it? If there is more than 1 spouse/sibling around, it is likely that it is a child. Hence, we put the age to be the mean of all people with many siblings. If the person is female and the name includes "Mrs/Mlle", then she is (supposedly) married and we put the age the mean of all wives.
+
+
+
+```{r}
+meanAgeWithManySiblings <- mean(filter(train,!is.na(Age) & SibSp>1)$Age)
+meanAgeofWifes <- mean(filter(train,!is.na(Age) & grepl("Mrs|Mlle",Name))$Age);
+train %>% mutate(Age=ifelse(is.na(Age) & SibSp>1,meanAgeWithManySiblings,Age)) -> train
+train %>% mutate(Age=ifelse(is.na(Age) & grepl("Mrs|Mlle",Name),meanAgeofWifes,Age)) -> train
+
+test %>% mutate(Age=ifelse(is.na(Age) & SibSp>1,meanAgeWithManySiblings,Age)) -> test
+test %>% mutate(Age=ifelse(is.na(Age) & grepl(c("Mlle"),Name),meanAgeofWifes,Age)) -> test
+
+```
+
+Impute fares
+
+```{r}
+
+meanFare <- function(pc,place){
+                    mean(filter(train,Pclass==pc & Embarked == place)$Fare)
+}
+train %>% rowwise() %>% mutate(Fare=ifelse(is.na(Fare) | Fare=="0",meanFare(Pclass,Embarked),Fare)) -> train
+test %>%  rowwise() %>% mutate(Fare=ifelse(is.na(Fare) | Fare == "0",meanFare(Pclass,Embarked),Fare)) -> test 
+```
+
+## Using Caret
+
+Preprocessing
+
+```{r}
+trainsub <- as.data.frame(select(train, - (Name | Ticket | Cabin)))
+trainsub$Survived <- as.factor(trainsub$Survived)
+
+tit_train_control <- trainControl(method="cv",number=10)
+preProcessing <- preProcess(select(trainsub,- (Survived)),method=c("knnImpute"))
+
+trainPrepro <- predict(preProcessing,trainsub)
+
+trainPrepro %>% rowwise() %>% mutate(Sex=ifelse(Sex=="female",0,1)) -> trainPrepro
+trainPrepro %>% rowwise() %>% mutate(Embarked=case_when(Embarked == "S" ~ 0, Embarked == "Q" ~ 1, Embarked == "C" ~ 2, TRUE ~ 0)) -> trainPrepro
+```
+
+Entscheidungsbaum:
+
+```{r}
+
+my_tuning_grid <- expand.grid(cp = seq(0.01,0.08,0.01))
+
+decisiontree <- caret::train(Survived ~ ., data=trainPrepro, method="xgbDART", trControl=tit_train_control)
+#treebag/rpart
+
+prediction1 <- predict(decisiontree,trainPrepro)
+
+confusionMatrix(prediction1,trainPrepro$Survived)
+
+```
+
+Random forest with rf:
+
+```{r}
+
+my_tuning_grid <- expand.grid(mtry = c(2:4))
+
+rftree <- caret::train(Survived ~ ., data=trainPrepro, method="rf",trControl=tit_train_control, tuneGrid=my_tuning_grid, importance = TRUE)
+varImp(rftree)
+
+prediction <- predict(rftree,trainPrepro)
+
+confusionMatrix(prediction,trainPrepro$Survived)
+
+```
+
+
+Random forest with ranger:
+
+```{r}
+
+my_tuning_grid <- expand.grid(mtry = c(1,2, 3),
+                      splitrule = c("gini", "extratrees"),
+                      min.node.size = c(1, 3,5))
+
+rangertree <- caret::train(Survived ~ ., data=trainPrepro, method="ranger",trControl=tit_train_control, tuneGrid=my_tuning_grid)
+
+prediction <- predict(rangertree,trainPrepro)
+
+confusionMatrix(prediction,trainPrepro$Survived)
+
+```
+
+Gradient boosting:
+
+```{r}
+myGrid <- expand.grid(n.trees = c(150, 200, 250, 300),
+ interaction.depth = c(1, 2,3),
+ shrinkage = c(0.05, 0.1, 0.15),
+ n.minobsinnode = c(5,10))
+
+gbm_tree <- caret::train(Survived ~., data = trainPrepro, method = "gbm", trControl = tit_train_control, verbose = FALSE, tuneGrid=myGrid)
+
+prediction <- predict(gbm_tree,trainPrepro)
+
+confusionMatrix(prediction,trainPrepro$Survived)
+```
+
+
+Compare models
+
+```{r}
+resamps <- resamples(list(gbm = gbm_tree, randomForest = rftree, dt=decisiontree,ranger=rangertree))
+summary(resamps)
+
+
+```
+#Tune Ranger
+
+```{r}
+survival.task <- makeClassifTask(data=trainPrepro,target="Survived")
+estimateTimeTuneRanger(survival.task)
+
+res = tuneRanger(survival.task, num.trees = 1000, num.threads = 2, iters = 70, save.file.path = NULL)
+res$model
+
+tunerprediction <- predict(res$model, newdata = testPrepro)
+#confusionMatrix(tunerprediction$data$response,trainPrePro$Survived)
+
+```
+
+
+Apply to test data:
+
+```{r}
+testsub <- select(test, - (Name | Ticket | Cabin))
+testPrepro <- predict(preProcessing,testsub)
+testPrepro %>% rowwise() %>% mutate(Sex=ifelse(Sex=="female",0,1)) -> testPrepro
+testPrepro %>% rowwise() %>% mutate(Embarked=case_when(Embarked == "S" ~ 0, Embarked == "Q" ~ 1, Embarked == "C" ~ 2, TRUE ~ 0)) -> testPrepro
+dtprediction <- predict(decisiontree,newdata=testPrepro,na.action = na.pass)
+rfprediction <- predict(rftree,newdata=testPrepro,na.action = na.pass)
+rangerprediction <- predict(rangertree,newdata=testPrepro,na.action = na.pass)
+gbmprediction <- predict(gbm_tree,newdata=testPrepro)
+
+#mixed model
+ prediction<- data.frame(dt=as.integer(as.character(dtprediction)),rf=as.integer(as.character(rfprediction)),ranger=as.integer(as.character(rangerprediction)),gbm=as.integer(as.character(gbmprediction)))
+  
+prediction %>% rowwise() %>% mutate(decision=ifelse(dt+rf+ranger+gbm>=2,1,0)) -> prediction
+  
+results <- data.frame(PassengerId=testsub$PassengerId,Survived=prediction$decision)
+
+#single model
+
+#results <- data.frame(PassengerId=testsub$PassengerId,Survived=tunerprediction$data$response)
+
+
+write.table(results,"~/R/Titanic/results.csv",sep=",",row.names = FALSE)
+
+```
